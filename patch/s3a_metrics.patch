@@ -1,0 +1,63 @@
+diff --git a/core/src/main/scala/org/apache/spark/SparkContext.scala b/core/src/main/scala/org/apache/spark/SparkContext.scala
+index 011e19f..a20d857 100644
+--- a/core/src/main/scala/org/apache/spark/SparkContext.scala
++++ b/core/src/main/scala/org/apache/spark/SparkContext.scala
+@@ -574,6 +574,7 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
+     // Post init
+     _taskScheduler.postStartHook()
+     _env.metricsSystem.registerSource(new BlockManagerSource(_env.blockManager))
++    _env.metricsSystem.registerSource(new org.apache.spark.ext.DriverFileSystemSource())
+     _executorAllocationManager.foreach { e =>
+       _env.metricsSystem.registerSource(e.executorAllocationManagerSource)
+     }
+diff --git a/core/src/main/scala/org/apache/spark/executor/ExecutorSource.scala b/core/src/main/scala/org/apache/spark/executor/ExecutorSource.scala
+index 293c512..51c047f 100644
+--- a/core/src/main/scala/org/apache/spark/executor/ExecutorSource.scala
++++ b/core/src/main/scala/org/apache/spark/executor/ExecutorSource.scala
+@@ -65,7 +65,7 @@ class ExecutorSource(threadPool: ThreadPoolExecutor, executorId: String) extends
+   })
+ 
+   // Gauge for file system stats of this executor
+-  for (scheme <- Array("hdfs", "file")) {
++  for (scheme <- Array("hdfs", "file", "s3a")) {
+     registerFileSystemStat(scheme, "read_bytes", _.getBytesRead(), 0L)
+     registerFileSystemStat(scheme, "write_bytes", _.getBytesWritten(), 0L)
+     registerFileSystemStat(scheme, "read_ops", _.getReadOps(), 0)
+diff --git a/core/src/main/scala/org/apache/spark/ext/DriverFileSystemSource.scala b/core/src/main/scala/org/apache/spark/ext/DriverFileSystemSource.scala
+new file mode 100644
+index 0000000..015caae
+--- /dev/null
++++ b/core/src/main/scala/org/apache/spark/ext/DriverFileSystemSource.scala
+@@ -0,0 +1,32 @@
++/**
++ * Created by ywang on 10/4/15.
++ */
++package org.apache.spark.ext
++
++import scala.collection.JavaConverters._
++import com.codahale.metrics.{Gauge, MetricRegistry}
++import org.apache.hadoop.fs.FileSystem
++import org.apache.spark.metrics.source.Source
++
++class DriverFileSystemSource extends Source {
++
++  private def fileStats(scheme: String) : Option[FileSystem.Statistics] =
++    FileSystem.getAllStatistics.asScala.find(s => s.getScheme.equals(scheme))
++
++  private def registerFileSystemStat[T](scheme: String, name: String, f: FileSystem.Statistics => T, defaultValue: T) = {
++    metricRegistry.register(MetricRegistry.name("filesystem", scheme, name), new Gauge[T] {
++      override def getValue: T = fileStats(scheme).map(f).getOrElse(defaultValue)
++    })
++  }
++  override val metricRegistry = new MetricRegistry()
++  override val sourceName = "driver"
++
++  // Gauge for file system stats of this executor
++  for (scheme <- Array("hdfs", "file", "s3a")) {
++    registerFileSystemStat(scheme, "read_bytes", _.getBytesRead(), 0L)
++    registerFileSystemStat(scheme, "write_bytes", _.getBytesWritten(), 0L)
++    registerFileSystemStat(scheme, "read_ops", _.getReadOps(), 0)
++    registerFileSystemStat(scheme, "largeRead_ops", _.getLargeReadOps(), 0)
++    registerFileSystemStat(scheme, "write_ops", _.getWriteOps(), 0)
++  }
++}
