@@ -1,0 +1,93 @@
+diff --git a/core/src/main/scala/org/apache/spark/deploy/worker/ExecutorRunner.scala b/core/src/main/scala/org/apache/spark/deploy/worker/ExecutorRunner.scala
+index 3aef051..316df87 100644
+--- a/core/src/main/scala/org/apache/spark/deploy/worker/ExecutorRunner.scala
++++ b/core/src/main/scala/org/apache/spark/deploy/worker/ExecutorRunner.scala
+@@ -143,6 +143,7 @@ private[deploy] class ExecutorRunner(
+         s"http://$publicAddress:$webUiPort/logPage/?appId=$appId&executorId=$execId&logType="
+       builder.environment.put("SPARK_LOG_URL_STDERR", s"${baseUrl}stderr")
+       builder.environment.put("SPARK_LOG_URL_STDOUT", s"${baseUrl}stdout")
++      builder.environment.put("SPARK_LOG_BASE_URL", s"$baseUrl")
+ 
+       process = builder.start()
+       val header = "Spark Executor Command: %s\n%s\n\n".format(
+diff --git a/core/src/main/scala/org/apache/spark/deploy/worker/ui/LogPage.scala b/core/src/main/scala/org/apache/spark/deploy/worker/ui/LogPage.scala
+index 5a1d06e..0adb19d 100644
+--- a/core/src/main/scala/org/apache/spark/deploy/worker/ui/LogPage.scala
++++ b/core/src/main/scala/org/apache/spark/deploy/worker/ui/LogPage.scala
+@@ -31,7 +31,6 @@ import org.apache.spark.util.logging.RollingFileAppender
+ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with Logging {
+   private val worker = parent.worker
+   private val workDir = parent.workDir
+-  private val supportedLogTypes = Set("stderr", "stdout")
+ 
+   def renderLog(request: HttpServletRequest): String = {
+     val defaultBytes = 100 * 1024
+@@ -133,10 +132,6 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
+       byteLength: Int
+     ): (String, Long, Long, Long) = {
+ 
+-    if (!supportedLogTypes.contains(logType)) {
+-      return ("Error: Log type must be one of " + supportedLogTypes.mkString(", "), 0, 0, 0)
+-    }
+-
+     // Verify that the normalized path of the log directory is in the working directory
+     val normalizedUri = new URI(logDirectory).normalize()
+     val normalizedLogDir = new File(normalizedUri.getPath)
+diff --git a/core/src/main/scala/org/apache/spark/executor/CoarseGrainedExecutorBackend.scala b/core/src/main/scala/org/apache/spark/executor/CoarseGrainedExecutorBackend.scala
+index a9c6a05..1ad2776 100644
+--- a/core/src/main/scala/org/apache/spark/executor/CoarseGrainedExecutorBackend.scala
++++ b/core/src/main/scala/org/apache/spark/executor/CoarseGrainedExecutorBackend.scala
+@@ -34,6 +34,8 @@ import org.apache.spark.scheduler.TaskDescription
+ import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
+ import org.apache.spark.serializer.SerializerInstance
+ import org.apache.spark.util.{ThreadUtils, SignalLogger, Utils}
++import org.apache.log4j.{FileAppender, LogManager, Logger}
++import scala.collection.JavaConverters._
+ 
+ private[spark] class CoarseGrainedExecutorBackend(
+     override val rpcEnv: RpcEnv,
+@@ -74,9 +76,12 @@ private[spark] class CoarseGrainedExecutorBackend(
+   }
+ 
+   def extractLogUrls: Map[String, String] = {
++    val baseUrl = sys.env.get("SPARK_LOG_BASE_URL").get
++    val logFiles = CoarseGrainedExecutorBackend.ALL_LOG4J_FILE_NAMES
+     val prefix = "SPARK_LOG_URL_"
+     sys.env.filterKeys(_.startsWith(prefix))
+-      .map(e => (e._1.substring(prefix.length).toLowerCase, e._2))
++      .map(e => (e._1.substring(prefix.length).toLowerCase, e._2)) ++
++      logFiles.map(name => (name, s"${baseUrl}${name}")).toMap
+   }
+ 
+   override def receive: PartialFunction[Any, Unit] = {
+@@ -139,6 +144,17 @@ private[spark] class CoarseGrainedExecutorBackend(
+ }
+ 
+ private[spark] object CoarseGrainedExecutorBackend extends Logging {
++ lazy val ALL_LOG4J_FILE_NAMES = {
++    val allLoggers: List[Logger] =
++      LogManager.getCurrentLoggers().asScala.toList.map(_.asInstanceOf[Logger]) :+
++        LogManager.getRootLogger()
++
++      allLoggers
++        .flatMap(_.getAllAppenders.asScala)
++        .filter(_.isInstanceOf[FileAppender])
++        .map(_.asInstanceOf[FileAppender].getFile)
++        .toSet
++  }
+ 
+   private def run(
+       driverUrl: String,
+diff --git a/core/src/main/scala/org/apache/spark/ui/exec/ExecutorsPage.scala b/core/src/main/scala/org/apache/spark/ui/exec/ExecutorsPage.scala
+index 1a29b0f..7108777 100644
+--- a/core/src/main/scala/org/apache/spark/ui/exec/ExecutorsPage.scala
++++ b/core/src/main/scala/org/apache/spark/ui/exec/ExecutorsPage.scala
+@@ -148,7 +148,7 @@ private[ui] class ExecutorsPage(
+         if (logsExist) {
+           <td>
+             {
+-              info.executorLogs.map { case (logName, logUrl) =>
++              info.executorLogs.toSeq.sortBy(_._1).map { case (logName, logUrl) =>
+                 <div>
+                   <a href={logUrl}>
+                     {logName}
